@@ -17,12 +17,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"io/ioutil"
+	"encoding/xml"
 )
 
 const Version = "developing"
@@ -104,6 +105,8 @@ func (b *Bucket) Put(object string, content io.Reader, headers map[string]string
 		return err
 	}
 
+	defer resp.Body.Close()
+
 	if resp.StatusCode != 200 {
 		err = errors.New(resp.Status)
 		return err
@@ -123,12 +126,175 @@ func (b *Bucket) PutFile(object, filepath string, headers map[string]string) err
 	return b.Put(object, file, headers)
 }
 
+func (b* Bucket) InitiateMultipartUpload(object string, headers map[string]string) (string, error) {
+	header := make(http.Header)
+
+	resp, err := b.do("POST", b.name, string(b.region), object+"?uploads", header, nil)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		err = errors.New(resp.Status)
+		return "", err
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+//	fmt.Println(string(body))
+	result := initiateMultipartUploadResult{}
+	err = xml.Unmarshal(body, &result)
+	if err != nil {
+		return "", err
+	}
+	return result.UploadId, nil
+}
+
+type initiateMultipartUploadResult struct {
+	Bucket   string `xml:"Bucket"`
+	Key      string `xml:"Key"`
+	UploadId string `xml:"UploadId"`
+}
+
+func (b* Bucket) AbortMultipartUpload(object string, uploadId string) (error) {
+	resp, err := b.do("DELETE", b.name, string(b.region), object+"?uploadId="+uploadId, nil, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 204 {
+		err = errors.New(resp.Status)
+		return err
+	}
+
+	return nil
+}
+
+// PUT the given `content` as `object`.
+func (b *Bucket) UploadPart(object string, uploadId string, partNumber int, data []byte) (string, error) {
+	fmt.Printf("UploadPart:%d\n", partNumber)
+	path := fmt.Sprintf("%s?partNumber=%d&uploadId=%s", object, partNumber, uploadId)
+	header := make(http.Header)
+	header.Set("Content-Length", strconv.Itoa(len(data)))
+
+	resp, err := b.do("PUT", b.name, string(b.region), path, header, bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		err = errors.New(resp.Status)
+		return "", err
+	}
+
+	etags := resp.Header["Etag"]
+	if len(etags) != 0 {
+		return etags[0], nil
+	} else {
+		return "", nil
+	}
+}
+
+type completeMultipartUpload struct {
+	XMLName   xml.Name `xml:"CompleteMultipartUpload"`
+	Parts     []uploadPart `xml:"Part"`
+}
+
+type uploadPart struct {
+	PartNumber    int    `xml:"PartNumber"`
+	ETag          string    `xml:"ETag"`
+}
+
+// PUT the given `content` as `object`.
+func (b *Bucket) CompleteMultipartUpload(object string, uploadId string, etags []string) error {
+	req := completeMultipartUpload{}
+	for index, etag := range etags {
+		req.Parts = append(req.Parts, uploadPart{PartNumber:index+1, ETag:etag})
+	}
+	data, error := xml.Marshal(&req)
+	if error != nil {
+		return error
+	}
+	path := fmt.Sprintf("%s?uploadId=%s", object, uploadId)
+
+	header := make(http.Header)
+	header.Set("Content-Length", strconv.Itoa(len(data)))
+	resp, err := b.do("POST", b.name, string(b.region), path, header, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	d, err := ioutil.ReadAll(resp.Body)
+	fmt.Println(string(d))
+	if resp.StatusCode != 200 {
+		err = errors.New(resp.Status)
+		return err
+	}
+	return nil
+}
+
+func (b *Bucket) PutLargeFile(object, filepath string, headers map[string]string) error {
+	file, err := os.Open(filepath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	uploadId, error := b.InitiateMultipartUpload(object, headers)
+	if error != nil {
+		return error
+	}
+	var partNumber int = 1
+	var offset int64 = 0
+	etags := []string{}
+	for {
+		buff := make([]byte, 1024*1024*10)
+		count, error := file.ReadAt(buff, offset)
+		var eof bool = false
+		if error != nil {
+			if error != io.EOF {
+				b.AbortMultipartUpload(object, uploadId)
+				return error
+			} else {
+				buff, _ = ioutil.ReadAll(io.LimitReader(bytes.NewReader(buff), (int64)(count)))
+				eof = true
+			}
+		}
+		etag, error := b.UploadPart(object, uploadId, partNumber, buff)
+		if error != nil {
+			b.AbortMultipartUpload(object, uploadId)
+			return error
+		}
+		etags = append(etags, etag)
+		if eof {
+			break
+		}
+		partNumber = partNumber+1
+		offset = offset+int64(count)
+	}
+	error = b.CompleteMultipartUpload(object, uploadId, etags)
+	if error != nil {
+		b.AbortMultipartUpload(object, uploadId)
+		return error
+	}
+	return nil
+}
+
 // DELETE the given `object`.
 func (b *Bucket) Delete(object string) error {
 	resp, err := b.do("DELETE", b.name, string(b.region), object, nil, nil)
 	if err != nil {
 		return err
 	}
+
+	defer resp.Body.Close()
 
 	if resp.StatusCode != 204 {
 		err = errors.New(resp.Status)
@@ -218,7 +384,7 @@ func (c *Client) canonicalizeHeaders(header http.Header) string {
 	sort.Strings(ossHeaders)
 
 	for _, k := range ossHeaders {
-		canonicalizedHeaders += k + ":" + header.Get(k) + "\n"
+		canonicalizedHeaders += k+":"+header.Get(k)+"\n"
 	}
 
 	return canonicalizedHeaders
@@ -231,20 +397,26 @@ func (c *Client) canonicalizeHeaders(header http.Header) string {
 //     - ignore non override headers
 //     - sort lexicographically
 func (c *Client) canonicalizeResource(resource string) string {
-	u, _ := url.Parse(resource)
-
-	queryies := u.Query()
-	query := url.Values{}
-
-	sort.Strings(resourceQSWhitelist)
-	for _, q := range resourceQSWhitelist {
-		val := queryies.Get(q)
-		if val != "" {
-			query.Add(q, val)
-		}
-	}
-
-	u.RawQuery = query.Encode()
-
-	return u.String()
+	return resource
+	//	u, _ := url.Parse(resource)
+	//
+	//	queryies := u.Query()
+	//	fmt.Println(queryies)
+	//	query := url.Values{}
+	//
+	//	sort.Strings(resourceQSWhitelist)
+	//	for _, q := range resourceQSWhitelist {
+	//		val := queryies[q]
+	//		if len(val) > 0 {
+	//			query[q] = val
+	//		}
+	////		val := queryies.Get(q)
+	////		if val != "" {
+	////			query.Add(q, val)
+	////		}
+	//	}
+	//
+	//	u.RawQuery = query.Encode()
+	//	fmt.Println(u.String())
+	//	return u.String()
 }
